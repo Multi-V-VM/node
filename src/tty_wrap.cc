@@ -161,6 +161,9 @@ void TTYWrap::SetRawMode(const FunctionCallbackInfo<Value>& args) {
   int err = uv_tty_set_mode(
       &wrap->handle_,
       args[0]->IsTrue() ? UV_TTY_MODE_RAW_VT : UV_TTY_MODE_NORMAL);
+#ifdef __wasi__
+  if (err == UV_ENOTSUP) err = 0;
+#endif
   args.GetReturnValue().Set(err);
 }
 

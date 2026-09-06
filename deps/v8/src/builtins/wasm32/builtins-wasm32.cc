@@ -68,6 +68,7 @@
 #include "src/objects/smi.h"
 #include "src/objects/source-text-module.h"
 #include "src/objects/tagged-index.h"
+#include "src/objects/template-objects-inl.h"
 #include "src/numbers/conversions.h"
 #include "src/numbers/math-random.h"
 #include "src/regexp/regexp.h"
@@ -2558,16 +2559,11 @@ bool ScheduleAsyncGeneratorAwait(
     Isolate* isolate, DirectHandle<JSAsyncGeneratorObject> generator,
     DirectHandle<Object> value, bool yield, Address* out_result) {
   ReadOnlyRoots roots(isolate);
-  DirectHandle<JSPromise> awaited;
-  if (IsJSPromise(*value)) {
-    awaited = direct_handle(Cast<JSPromise>(*value), isolate);
-  } else {
-    awaited = isolate->factory()->NewJSPromise();
-    DirectHandle<Object> resolve_result;
-    if (!JSPromise::Resolve(awaited, value).ToHandle(&resolve_result)) {
-      *out_result = roots.exception().ptr();
-      return false;
-    }
+  DirectHandle<JSPromise> awaited = isolate->factory()->NewJSPromise();
+  DirectHandle<Object> resolve_result;
+  if (!JSPromise::Resolve(awaited, value).ToHandle(&resolve_result)) {
+    *out_result = roots.exception().ptr();
+    return false;
   }
 
   DirectHandle<NativeContext> native_context = isolate->native_context();
@@ -3103,19 +3099,13 @@ bool TryRunRuntimeCallBytecode(Isolate* isolate, Tagged<BytecodeArray> bytecode,
     DirectHandle<JSAsyncFunctionObject> async_function(
         Cast<JSAsyncFunctionObject>(Tagged<Object>(async_function_address)),
         isolate);
-    DirectHandle<JSPromise> awaited;
-    if (IsJSPromise(Tagged<Object>(value_address))) {
-      awaited = direct_handle(
-          Cast<JSPromise>(Tagged<Object>(value_address)), isolate);
-    } else {
-      awaited = isolate->factory()->NewJSPromise();
-      DirectHandle<Object> value(Tagged<Object>(value_address), isolate);
-      DirectHandle<Object> resolve_result;
-      if (!JSPromise::Resolve(awaited, value).ToHandle(&resolve_result)) {
-        if (switched_context) isolate->set_context(saved_context);
-        *out_result = roots.exception().ptr();
-        return true;
-      }
+    DirectHandle<JSPromise> awaited = isolate->factory()->NewJSPromise();
+    DirectHandle<Object> value(Tagged<Object>(value_address), isolate);
+    DirectHandle<Object> resolve_result;
+    if (!JSPromise::Resolve(awaited, value).ToHandle(&resolve_result)) {
+      if (switched_context) isolate->set_context(saved_context);
+      *out_result = roots.exception().ptr();
+      return true;
     }
 
     DirectHandle<NativeContext> native_context = isolate->native_context();
@@ -4369,10 +4359,15 @@ bool TryRunCatchContextBytecode(Isolate* isolate,
                                 Address* out_result) {
   ReadOnlyRoots roots(isolate);
   if (bytecode_enum == interpreter::Bytecode::kSetPendingMessage) {
-    Address message_address = SafeTaggedOrUndefined(
-        isolate, g_wasm_regs[SlotFor(kInterpreterAccumulatorRegister)]);
+    Address message_address =
+        g_wasm_regs[SlotFor(kInterpreterAccumulatorRegister)];
+    if (!IsSafeTaggedHandleValue(message_address) &&
+        !IsKnownReadOnlyRootValue(isolate, message_address)) {
+      *out_result = roots.exception().ptr();
+      return true;
+    }
     Tagged<Object> message(message_address);
-    if (!IsHeapObject(message)) {
+    if (!IsTheHole(message, isolate) && !IsJSMessageObject(message)) {
       *out_result = roots.exception().ptr();
       return true;
     }
@@ -7132,6 +7127,96 @@ bool TryRunStringPrototypeTransformBuiltin(
   return true;
 }
 
+bool TryRunRegExpPrototypeReplaceBuiltin(
+    Isolate* isolate, DirectHandle<Object> callable,
+    DirectHandle<Object> receiver, int arg_count, DirectHandle<Object>* args,
+    Address* out_result) {
+  if (!IsJSFunctionBuiltin(isolate, callable,
+                           Builtin::kRegExpPrototypeReplace)) {
+    return false;
+  }
+
+  ReadOnlyRoots roots(isolate);
+  if (!IsJSRegExp(*receiver)) {
+    isolate->Throw(*isolate->factory()->NewTypeError(
+        MessageTemplate::kIncompatibleMethodReceiver,
+        isolate->factory()->NewStringFromAsciiChecked(
+            "RegExp.prototype[Symbol.replace]"),
+        receiver));
+    *out_result = roots.exception().ptr();
+    return true;
+  }
+
+  DirectHandle<Object> input_value =
+      arg_count > 0 ? args[0]
+                    : direct_handle(roots.undefined_value(), isolate);
+  DirectHandle<String> input;
+  if (!Object::ToString(isolate, input_value).ToHandle(&input)) {
+    *out_result = roots.exception().ptr();
+    return true;
+  }
+
+  DirectHandle<Object> replacement =
+      arg_count > 1 ? args[1]
+                    : direct_handle(roots.undefined_value(), isolate);
+  if (!IsCallable(*replacement)) {
+    DirectHandle<String> replacement_string;
+    if (!Object::ToString(isolate, replacement).ToHandle(&replacement_string)) {
+      *out_result = roots.exception().ptr();
+      return true;
+    }
+    replacement = replacement_string;
+  }
+
+  DirectHandle<NativeContext> native_context(
+      isolate->context()->native_context(), isolate);
+  DirectHandle<JSReceiver> string_prototype(
+      Cast<JSReceiver>(native_context->initial_string_prototype()), isolate);
+  DirectHandle<Name> replace_name =
+      isolate->factory()->InternalizeUtf8String("replace");
+  DirectHandle<Object> string_replace =
+      JSReceiver::GetDataProperty(isolate, string_prototype, replace_name);
+  DirectHandle<Object> forwarded_args[2] = {receiver, replacement};
+  return TryRunStringPrototypeTransformBuiltin(
+      isolate, string_replace, input, 2, forwarded_args, out_result);
+}
+
+bool TryRunRegExpPrototypeSplitBuiltin(
+    Isolate* isolate, DirectHandle<Object> callable,
+    DirectHandle<Object> receiver, int arg_count, DirectHandle<Object>* args,
+    Address* out_result) {
+  if (!IsJSFunctionBuiltin(isolate, callable,
+                           Builtin::kRegExpPrototypeSplit) ||
+      !IsJSRegExp(*receiver)) {
+    return false;
+  }
+
+  ReadOnlyRoots roots(isolate);
+  DirectHandle<Object> input_value =
+      arg_count > 0 ? args[0]
+                    : direct_handle(roots.undefined_value(), isolate);
+  DirectHandle<String> input;
+  if (!Object::ToString(isolate, input_value).ToHandle(&input)) {
+    *out_result = roots.exception().ptr();
+    return true;
+  }
+
+  DirectHandle<Object> limit =
+      arg_count > 1 ? args[1]
+                    : direct_handle(roots.undefined_value(), isolate);
+  DirectHandle<NativeContext> native_context(
+      isolate->context()->native_context(), isolate);
+  DirectHandle<JSReceiver> string_prototype(
+      Cast<JSReceiver>(native_context->initial_string_prototype()), isolate);
+  DirectHandle<Name> split_name =
+      isolate->factory()->InternalizeUtf8String("split");
+  DirectHandle<Object> string_split =
+      JSReceiver::GetDataProperty(isolate, string_prototype, split_name);
+  DirectHandle<Object> forwarded_args[2] = {receiver, limit};
+  return TryRunStringPrototypeTransformBuiltin(
+      isolate, string_split, input, 2, forwarded_args, out_result);
+}
+
 bool TryRunStringPrototypeReplaceAllBuiltin(
     Isolate* isolate, DirectHandle<Object> callable,
     DirectHandle<Object> receiver, int arg_count, DirectHandle<Object>* args,
@@ -7870,6 +7955,85 @@ bool TryRunArrayShiftBuiltin(Isolate* isolate, DirectHandle<Object> callable,
   }
 
   *out_result = (*first).ptr();
+  return true;
+}
+
+bool TryRunArrayLastIndexOfBuiltin(Isolate* isolate,
+                                   DirectHandle<Object> callable,
+                                   DirectHandle<Object> receiver,
+                                   int arg_count, DirectHandle<Object>* args,
+                                   Address* out_result) {
+  if (!IsJSFunctionBuiltin(isolate, callable,
+                           Builtin::kArrayPrototypeLastIndexOf)) {
+    return false;
+  }
+
+  ReadOnlyRoots roots(isolate);
+  DirectHandle<JSReceiver> object;
+  if (!Object::ToObject(isolate, receiver, "Array.prototype.lastIndexOf")
+           .ToHandle(&object)) {
+    *out_result = roots.exception().ptr();
+    return true;
+  }
+
+  DirectHandle<Object> length_object;
+  if (!Object::GetLengthFromArrayLike(isolate, object)
+           .ToHandle(&length_object)) {
+    *out_result = roots.exception().ptr();
+    return true;
+  }
+  double length = Object::NumberValue(*length_object);
+  if (length <= 0) {
+    *out_result = Smi::FromInt(-1).ptr();
+    return true;
+  }
+  if (length > JSObject::kMaxElementIndex) return false;
+
+  double from = length - 1;
+  if (arg_count > 1) {
+    DirectHandle<Number> from_number;
+    if (!Object::ToInteger(isolate, args[1]).ToHandle(&from_number)) {
+      *out_result = roots.exception().ptr();
+      return true;
+    }
+    from = Object::NumberValue(*from_number);
+    if (from >= 0) {
+      from = std::min(from, length - 1);
+    } else {
+      from += length;
+    }
+  }
+  if (from < 0) {
+    *out_result = Smi::FromInt(-1).ptr();
+    return true;
+  }
+
+  DirectHandle<Object> search =
+      arg_count > 0 ? args[0]
+                    : direct_handle(roots.undefined_value(), isolate);
+  for (int64_t index = static_cast<int64_t>(from); index >= 0; --index) {
+    Maybe<bool> has = JSReceiver::HasElement(
+        isolate, object, static_cast<uint32_t>(index));
+    if (has.IsNothing()) {
+      *out_result = roots.exception().ptr();
+      return true;
+    }
+    if (!has.FromJust()) continue;
+    DirectHandle<Object> element;
+    if (!JSReceiver::GetElement(isolate, object,
+                                static_cast<uint32_t>(index))
+             .ToHandle(&element)) {
+      *out_result = roots.exception().ptr();
+      return true;
+    }
+    if (Object::StrictEquals(*element, *search)) {
+      *out_result =
+          (*isolate->factory()->NewNumberFromInt64(index)).ptr();
+      return true;
+    }
+  }
+
+  *out_result = Smi::FromInt(-1).ptr();
   return true;
 }
 
@@ -9808,6 +9972,53 @@ bool TryRunArrayIteratorPrototypeNextBuiltin(Isolate* isolate,
   return true;
 }
 
+bool TryRunStringIteratorPrototypeNextBuiltin(Isolate* isolate,
+                                              DirectHandle<Object> callable,
+                                              DirectHandle<Object> receiver,
+                                              Address* out_result) {
+  if (!IsJSFunctionBuiltin(isolate, callable,
+                           Builtin::kStringIteratorPrototypeNext)) {
+    return false;
+  }
+
+  ReadOnlyRoots roots(isolate);
+  if (!IsJSStringIterator(*receiver)) {
+    isolate->Throw(*isolate->factory()->NewTypeError(
+        MessageTemplate::kIncompatibleMethodReceiver,
+        isolate->factory()->NewStringFromAsciiChecked(
+            "String Iterator.prototype.next"),
+        receiver));
+    *out_result = roots.exception().ptr();
+    return true;
+  }
+
+  DirectHandle<JSStringIterator> iterator =
+      Cast<JSStringIterator>(receiver);
+  DirectHandle<String> string(iterator->string(), isolate);
+  int position = iterator->index();
+  if (position >= string->length()) {
+    *out_result =
+        (*isolate->factory()->NewJSIteratorResult(
+             isolate->factory()->undefined_value(), true))
+            .ptr();
+    return true;
+  }
+
+  int character_length = 1;
+  uint16_t first = string->Get(position);
+  if (first >= 0xd800 && first <= 0xdbff &&
+      position + 1 < string->length()) {
+    uint16_t second = string->Get(position + 1);
+    if (second >= 0xdc00 && second <= 0xdfff) character_length = 2;
+  }
+  DirectHandle<String> value = isolate->factory()->NewProperSubString(
+      string, position, position + character_length);
+  iterator->set_index(position + character_length);
+  *out_result =
+      (*isolate->factory()->NewJSIteratorResult(value, false)).ptr();
+  return true;
+}
+
 bool TryRunCollectionForEachCallback(
     Isolate* isolate, DirectHandle<Object> callback,
     DirectHandle<Object> this_arg, DirectHandle<Object> value,
@@ -10692,6 +10903,8 @@ bool TryRunWasm32SharedBuiltinFallbacks(
                                 out_result) ||
       TryRunArrayAtBuiltin(isolate, callable, receiver, arg_count, args,
                            out_result) ||
+      TryRunArrayLastIndexOfBuiltin(isolate, callable, receiver, arg_count,
+                                    args, out_result) ||
       TryRunArraySliceBuiltin(isolate, callable, receiver, arg_count, args,
                               out_result) ||
       TryRunArraySpliceBuiltin(isolate, callable, receiver, arg_count, args,
@@ -10752,6 +10965,8 @@ bool TryRunWasm32SharedBuiltinFallbacks(
                                             out_result) ||
       TryRunArrayIteratorPrototypeNextBuiltin(isolate, callable, receiver,
                                               out_result) ||
+      TryRunStringIteratorPrototypeNextBuiltin(isolate, callable, receiver,
+                                               out_result) ||
       TryRunMapIteratorPrototypeNextBuiltin(isolate, callable, receiver,
                                             out_result) ||
       TryRunSetIteratorPrototypeNextBuiltin(isolate, callable, receiver,
@@ -10774,6 +10989,10 @@ bool TryRunWasm32SharedBuiltinFallbacks(
                                              arg_count, args, out_result) ||
       TryRunStringPrototypeTransformBuiltin(isolate, callable, receiver,
                                             arg_count, args, out_result) ||
+      TryRunRegExpPrototypeSplitBuiltin(isolate, callable, receiver, arg_count,
+                                        args, out_result) ||
+      TryRunRegExpPrototypeReplaceBuiltin(isolate, callable, receiver,
+                                          arg_count, args, out_result) ||
       TryRunStringPrototypeSliceBuiltin(isolate, callable, receiver, arg_count,
                                         args, out_result) ||
       TryRunStringPrototypeSubstrBuiltin(isolate, callable, receiver,
@@ -11180,7 +11399,7 @@ bool TryRunCallBytecode(Isolate* isolate, Tagged<BytecodeArray> bytecode,
         v8_wasm32_silent_fprintf(stderr, " op%d=%d:0x%x:%s", i, operand,
                      static_cast<unsigned>(value), value_type);
       }
-      v8_wasm32_silent_fprintf(stderr, "\n");
+      std::fprintf(stderr, "\n");
       if (noncallable_shared->StartPosition() == 5494521 &&
           operand_count > 2) {
         int32_t receiver_operand = ReadBytecodeSignedOperand(
@@ -15342,6 +15561,48 @@ bool TryRunCloneObjectBytecode(
   return true;
 }
 
+bool TryRunGetTemplateObjectBytecode(
+    Isolate* isolate, Tagged<BytecodeArray> bytecode, int bytecode_index,
+    interpreter::Bytecode bytecode_enum,
+    interpreter::OperandScale operand_scale,
+    Tagged<JSFunction> current_function, Address* out_result) {
+  if (bytecode_enum != interpreter::Bytecode::kGetTemplateObject) return false;
+
+  uint32_t description_index =
+      ReadBytecodeUnsignedOperand(bytecode, bytecode_index, bytecode_enum, 0,
+                                  operand_scale);
+  uint32_t slot_id =
+      ReadBytecodeUnsignedOperand(bytecode, bytecode_index, bytecode_enum, 1,
+                                  operand_scale);
+  Tagged<Object> description_object =
+      bytecode->constant_pool()->get(description_index);
+  if (!IsTemplateObjectDescription(description_object)) return false;
+
+  HandleScope scope(isolate);
+  WasmGCStateScope gc_state(isolate);
+  SetCurrentIsolateScope current_isolate_scope(isolate);
+  Tagged<Context> saved_context = isolate->context();
+  Address context_address = CurrentInterpreterContext();
+  if (IsSafeTaggedRootValue(isolate, context_address) &&
+      IsContext(Tagged<Object>(context_address))) {
+    isolate->set_context(Cast<Context>(Tagged<Object>(context_address)));
+  }
+
+  DirectHandle<NativeContext> native_context(
+      isolate->context()->native_context(), isolate);
+  DirectHandle<TemplateObjectDescription> description(
+      Cast<TemplateObjectDescription>(description_object), isolate);
+  DirectHandle<SharedFunctionInfo> shared(
+      Wasm32JSFunctionShared(current_function), isolate);
+  DirectHandle<JSArray> result =
+      TemplateObjectDescription::GetTemplateObject(
+          isolate, native_context, description, shared,
+          static_cast<int>(slot_id));
+  *out_result = (*result).ptr();
+  isolate->set_context(saved_context);
+  return true;
+}
+
 bool TryRunCreateArrayLiteralBytecode(
     Isolate* isolate, Tagged<BytecodeArray> bytecode, int bytecode_index,
     interpreter::Bytecode bytecode_enum,
@@ -17815,6 +18076,45 @@ bool TryFallbackJSEntryBuiltin(Isolate* isolate, Builtin builtin,
     return true;
   }
 
+  int regexp_capture_index = -1;
+  switch (builtin) {
+    case Builtin::kRegExpCapture1Getter:
+      regexp_capture_index = 1;
+      break;
+    case Builtin::kRegExpCapture2Getter:
+      regexp_capture_index = 2;
+      break;
+    case Builtin::kRegExpCapture3Getter:
+      regexp_capture_index = 3;
+      break;
+    case Builtin::kRegExpCapture4Getter:
+      regexp_capture_index = 4;
+      break;
+    case Builtin::kRegExpCapture5Getter:
+      regexp_capture_index = 5;
+      break;
+    case Builtin::kRegExpCapture6Getter:
+      regexp_capture_index = 6;
+      break;
+    case Builtin::kRegExpCapture7Getter:
+      regexp_capture_index = 7;
+      break;
+    case Builtin::kRegExpCapture8Getter:
+      regexp_capture_index = 8;
+      break;
+    case Builtin::kRegExpCapture9Getter:
+      regexp_capture_index = 9;
+      break;
+    default:
+      break;
+  }
+  if (regexp_capture_index >= 0) {
+    DirectHandle<String> capture = RegExpUtils::GenericCaptureGetter(
+        isolate, isolate->regexp_last_match_info(), regexp_capture_index);
+    *out_result = (*capture).ptr();
+    return true;
+  }
+
   if (builtin == Builtin::kRegExpPrototypeFlagsGetter) {
     Tagged<Object> receiver_value(
         SafeTaggedOrUndefined(isolate, receiver));
@@ -17894,6 +18194,11 @@ bool TryFallbackJSEntryBuiltin(Isolate* isolate, Builtin builtin,
     }
     if (TryRunArrayFlatBuiltin(isolate, callable, receiver_object, actual_argc,
                                args, out_result)) {
+      return true;
+    }
+    if (TryRunRegExpPrototypeSplitBuiltin(
+            isolate, callable, receiver_object, actual_argc, args,
+            out_result)) {
       return true;
     }
     if (TryRunStringPrototypeTransformBuiltin(
@@ -18250,6 +18555,24 @@ bool TryFallbackJSEntryBuiltin(Isolate* isolate, Builtin builtin,
     *out_result = std::isfinite(Object::NumberValue(*number))
                       ? roots.true_value().ptr()
                       : roots.false_value().ptr();
+    return true;
+  }
+
+  if (builtin == Builtin::kMathClz32) {
+    HandleScope scope(isolate);
+    Address input_address = actual_argc > 0
+                                ? SafeTaggedOrUndefined(isolate, argv[0])
+                                : roots.undefined_value().ptr();
+    DirectHandle<Object> input(Tagged<Object>(input_address), isolate);
+    DirectHandle<Number> number;
+    if (!Object::ToNumber(isolate, input).ToHandle(&number)) {
+      *out_result = roots.exception().ptr();
+      return true;
+    }
+
+    const uint32_t value = NumberToUint32(*number);
+    const int leading_zeros = value == 0 ? 32 : __builtin_clz(value);
+    *out_result = Smi::FromInt(leading_zeros).ptr();
     return true;
   }
 
@@ -25616,6 +25939,16 @@ const bool trace_hb1_get =
       operand_scale = interpreter::OperandScale::kSingle;
       continue;
     }
+    if (TryRunGetTemplateObjectBytecode(
+            isolate, bytecode, bytecode_index, bytecode_enum, operand_scale,
+            Cast<JSFunction>(Tagged<Object>(target)), &fallback_result)) {
+      PublishWasmInterpreterFallbackResult(isolate, "bytecode fallback",
+                                           &fallback_result);
+      current_offset +=
+          interpreter::Bytecodes::Size(bytecode_enum, operand_scale);
+      operand_scale = interpreter::OperandScale::kSingle;
+      continue;
+    }
     if (TryRunCreateArrayLiteralBytecode(isolate, bytecode, bytecode_index,
                                          bytecode_enum, operand_scale,
                                          &fallback_result)) {
@@ -26422,6 +26755,12 @@ extern "C" Address WasmJSEntry(Address root, Address new_target, Address target,
     }
     void* fn = WasmBuiltinFuncref(builtin);
     if (fn == nullptr) {
+#ifdef __wasi__
+      v8_wasm32_silent_fprintf(
+          stderr, "WASM32_UNSUPPORTED_BUILTIN id=%d name=%s\n",
+          static_cast<int>(builtin), Builtins::name(builtin));
+      std::fflush(stderr);
+#endif
       if (kTraceWasmJSEntry) {
         PrintF("WasmJSEntry: unregistered builtin target=%d name=%s "
                "entry=0x%x\n",

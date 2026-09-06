@@ -81,7 +81,7 @@ static void InitConfig(Local<Object> target,
 
 #endif  // NODE_HAVE_I18N_SUPPORT
 
-#if HAVE_INSPECTOR
+#if HAVE_INSPECTOR && !defined(__wasi__)
   READONLY_TRUE_PROPERTY(target, "hasInspector");
 #else
   READONLY_FALSE_PROPERTY(target, "hasInspector");
